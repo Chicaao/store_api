@@ -1,53 +1,82 @@
-from typing import List
-from uuid import UUID
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
-import pymongo
-from store.db.mongo import db_client
-from store.models.product import ProductModel
-from store.schemas.product import ProductIn, ProductOut, ProductUpdate, ProductUpdateOut
+from datetime import datetime
+from typing import List, Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update as sqlalchemy_update, delete as sqlalchemy_delete
+from sqlalchemy.exc import IntegrityError
 from store.core.exceptions import NotFoundException
-
+from store.models.product import Product  # seu modelo ORM
+from store.schemas.product import ProductIn, ProductOut, ProductUpdate, ProductUpdateOut
 
 class ProductUsecase:
-    def __init__(self) -> None:
-        self.client: AsyncIOMotorClient = db_client.get()
-        self.database: AsyncIOMotorDatabase = self.client.get_database()
-        self.collection = self.database.get_collection("products")
+    def __init__(self, session: AsyncSession):
+        self.session = session
 
     async def create(self, body: ProductIn) -> ProductOut:
-        product_model = ProductModel(**body.model_dump())
-        await self.collection.insert_one(product_model.model_dump())
+        """
+        Cria um produto no banco.
+        Pode lançar IntegrityError se houver conflito (ex: produto duplicado).
+        """
+        product = Product(**body.dict())
+        self.session.add(product)
+        try:
+            await self.session.commit()
+            await self.session.refresh(product)
+            return ProductOut.from_orm(product)
+        except IntegrityError:
+            await self.session.rollback()
+            raise
 
-        return ProductOut(**product_model.model_dump())
-
-    async def get(self, id: UUID) -> ProductOut:
-        result = await self.collection.find_one({"id": id})
-
+    async def get(self, id: str) -> ProductOut:
+        """
+        Retorna um produto pelo ID.
+        """
+        result = await self.session.get(Product, id)
         if not result:
-            raise NotFoundException(message=f"Product not found with filter: {id}")
+            raise NotFoundException(f"Produto com id {id} não encontrado")
+        return ProductOut.from_orm(result)
 
-        return ProductOut(**result)
+    async def query(
+        self, name: Optional[str] = None, category: Optional[str] = None
+    ) -> List[ProductOut]:
+        """
+        Lista produtos com filtros opcionais.
+        """
+        stmt = select(Product)
+        if name:
+            stmt = stmt.where(Product.name.ilike(f"%{name}%"))
+        if category:
+            stmt = stmt.where(Product.category.ilike(f"%{category}%"))
+        result = await self.session.execute(stmt)
+        products = result.scalars().all()
+        return [ProductOut.from_orm(p) for p in products]
 
-    async def query(self) -> List[ProductOut]:
-        return [ProductOut(**item) async for item in self.collection.find()]
-
-    async def update(self, id: UUID, body: ProductUpdate) -> ProductUpdateOut:
-        result = await self.collection.find_one_and_update(
-            filter={"id": id},
-            update={"$set": body.model_dump(exclude_none=True)},
-            return_document=pymongo.ReturnDocument.AFTER,
-        )
-
-        return ProductUpdateOut(**result)
-
-    async def delete(self, id: UUID) -> bool:
-        product = await self.collection.find_one({"id": id})
+    async def update(self, id: str, body: ProductUpdate) -> ProductUpdateOut:
+        """
+        Atualiza um produto pelo ID.
+        Atualiza updated_at automaticamente.
+        """
+        product = await self.session.get(Product, id)
         if not product:
-            raise NotFoundException(message=f"Product not found with filter: {id}")
+            raise NotFoundException(f"Produto com id {id} não encontrado")
 
-        result = await self.collection.delete_one({"id": id})
+        for key, value in body.dict(exclude_unset=True).items():
+            setattr(product, key, value)
+        product.updated_at = datetime.utcnow()  # atualiza timestamp
 
-        return True if result.deleted_count > 0 else False
+        try:
+            await self.session.commit()
+            await self.session.refresh(product)
+            return ProductUpdateOut.from_orm(product)
+        except IntegrityError:
+            await self.session.rollback()
+            raise
 
-
-product_usecase = ProductUsecase()
+    async def delete(self, id: str) -> None:
+        """
+        Deleta um produto pelo ID.
+        """
+        product = await self.session.get(Product, id)
+        if not product:
+            raise NotFoundException(f"Produto com id {id} não encontrado")
+        await self.session.delete(product)
+        await self.session.commit()
